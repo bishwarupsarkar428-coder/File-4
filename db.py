@@ -40,10 +40,22 @@ class Database:
                     id      INTEGER PRIMARY KEY AUTOINCREMENT,
                     chat_id INTEGER UNIQUE NOT NULL,
                     title   TEXT NOT NULL,
-                    link    TEXT NOT NULL
+                    link    TEXT NOT NULL,
+                    mode    TEXT NOT NULL DEFAULT 'normal'
+                );
+                CREATE TABLE IF NOT EXISTS join_requests (
+                    chat_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    PRIMARY KEY (chat_id, user_id)
                 );
                 """
             )
+            # upgrade databases created before request mode existed
+            cols = [r[1] for r in self._conn.execute("PRAGMA table_info(forcesub)")]
+            if "mode" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE forcesub ADD COLUMN mode TEXT NOT NULL DEFAULT 'normal'"
+                )
             self._conn.commit()
 
     # ------------------------------------------------------------------ links
@@ -162,26 +174,48 @@ class Database:
             self._conn.commit()
 
     # -------------------------------------------------------------- forcesub
-    def add_forcesub(self, chat_id, title, link):
+    def add_forcesub(self, chat_id, title, link, mode="normal"):
         with self._lock:
             self._conn.execute(
-                "INSERT OR REPLACE INTO forcesub (chat_id, title, link) VALUES (?, ?, ?)",
-                (chat_id, title, link),
+                "INSERT INTO forcesub (chat_id, title, link, mode) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(chat_id) DO UPDATE SET title = excluded.title, "
+                "link = excluded.link, mode = excluded.mode",
+                (chat_id, title, link, mode),
             )
             self._conn.commit()
 
     def remove_forcesub(self, chat_id):
         with self._lock:
             self._conn.execute("DELETE FROM forcesub WHERE chat_id = ?", (chat_id,))
+            self._conn.execute("DELETE FROM join_requests WHERE chat_id = ?", (chat_id,))
             self._conn.commit()
 
     def clear_forcesub(self):
         with self._lock:
             self._conn.execute("DELETE FROM forcesub")
+            self._conn.execute("DELETE FROM join_requests")
             self._conn.commit()
 
     def list_forcesub(self):
+        """Return [(chat_id, title, link, mode), ...] in the order they were added."""
         with self._lock:
             return self._conn.execute(
-                "SELECT chat_id, title, link FROM forcesub ORDER BY id"
+                "SELECT chat_id, title, link, mode FROM forcesub ORDER BY id"
             ).fetchall()
+
+    # ---------------------------------------------------------- join requests
+    def add_join_request(self, chat_id, user_id):
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO join_requests (chat_id, user_id) VALUES (?, ?)",
+                (chat_id, user_id),
+            )
+            self._conn.commit()
+
+    def has_join_request(self, chat_id, user_id):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM join_requests WHERE chat_id = ? AND user_id = ?",
+                (chat_id, user_id),
+            ).fetchone()
+        return row is not None

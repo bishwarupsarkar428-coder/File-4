@@ -36,6 +36,7 @@ from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
+    ChatJoinRequestHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -386,31 +387,36 @@ def is_member(member) -> bool:
 async def missing_channels(context, user_id):
     """Force-sub channels the user has not joined (fails open on errors)."""
     missing = []
-    for chat_id, title, link in db(context).list_forcesub():
+    d = db(context)
+    for chat_id, title, link, mode in d.list_forcesub():
+        # request mode: a pending join request is enough
+        if mode == "request" and d.has_join_request(chat_id, user_id):
+            continue
         try:
             member = await context.bot.get_chat_member(chat_id, user_id)
         except TelegramError as exc:
             log.warning("Force-sub check failed for %s: %s", chat_id, exc)
             continue
         if not is_member(member):
-            missing.append((chat_id, title, link))
+            missing.append((chat_id, title, link, mode))
     return missing
 
 
 async def send_join_prompt(message, context, missing, payload):
     rows = [
-        [InlineKeyboardButton(f"Join {title}", url=link)]
-        for _, title, link in missing
+        [InlineKeyboardButton(
+            f"{'Request to join' if mode == 'request' else 'Join'} {title}", url=link)]
+        for _, title, link, mode in missing
         if link
     ]
     rows.append(
         [InlineKeyboardButton("Try Again", url=make_link(context, payload))]
     )
-    await message.reply_text(
-        "To use this bot, you must join our channel(s) first.\n"
-        "After joining, tap Try Again.",
-        reply_markup=InlineKeyboardMarkup(rows),
-    )
+    text = ("To use this bot, you must join our channel(s) first.\n"
+            "After joining, tap Try Again.")
+    if any(mode == "request" for *_, mode in missing):
+        text += "\n\nFor 'Request to join' channels, just send the join request - no need to wait for approval."
+    await message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
 
 
 # ------------------------------- access checks ------------------------------ #
@@ -681,6 +687,7 @@ def settings_view(context):
     protect = d.get_setting("protect") == "1"
     minutes = int(d.get_setting("autodel") or 0)
     short = d.get_setting("short") == "1"
+    approve = d.get_setting("autoapprove") == "1"
     autodel = f"{minutes} min" if minutes else "OFF"
     text = (
         "⚙️ Settings\n\n"
@@ -688,6 +695,7 @@ def settings_view(context):
         f"Auto-delete delivered files: {autodel}\n"
         f"Shorten generated links: {'ON' if short else 'OFF'}"
         + ("" if shortener_ready() else " (shortener not configured)")
+        + f"\nAuto-approve join requests (request mode): {'ON' if approve else 'OFF'}"
     )
     keyboard = InlineKeyboardMarkup(
         [
@@ -696,6 +704,8 @@ def settings_view(context):
             [InlineKeyboardButton(f"Auto-delete: {autodel}", callback_data="set:autodel")],
             [InlineKeyboardButton(f"Shorten links: {'ON' if short else 'OFF'}",
                                   callback_data="set:short")],
+            [InlineKeyboardButton(f"Auto-approve requests: {'ON' if approve else 'OFF'}",
+                                  callback_data="set:approve")],
             [InlineKeyboardButton("Close", callback_data="set:close")],
         ]
     )
@@ -733,6 +743,8 @@ async def settings_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             nxt = 0
         d.set_setting("autodel", nxt)
+    elif action == "approve":
+        d.set_setting("autoapprove", "0" if d.get_setting("autoapprove") == "1" else "1")
     elif action == "short":
         if not shortener_ready():
             await query.answer("Set SHORTENER_URL and SHORTENER_API first.", show_alert=True)
@@ -816,6 +828,8 @@ async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 FORCESUB_HELP = (
     "Force subscribe (admins only)\n\n"
     "/forcesub add <@channel or id> – users must join it\n"
+    "/forcesub add <@channel or id> request – REQUEST MODE: users only need to "
+    "send a join request (for private channels)\n"
     "/forcesub remove <@channel, id or number>\n"
     "/forcesub list – show channels\n"
     "/forcesub clear – turn force subscribe off\n\n"
@@ -828,14 +842,17 @@ def forcesub_list_text(context):
     rows = db(context).list_forcesub()
     if not rows:
         return "Force subscribe is OFF (no channels)."
-    lines = [f"{i}. {title} ({chat_id})" for i, (chat_id, title, _) in enumerate(rows, 1)]
+    lines = [
+        f"{i}. {title} ({chat_id})" + (" [request mode]" if mode == "request" else "")
+        for i, (chat_id, title, _link, mode) in enumerate(rows, 1)
+    ]
     return "Force subscribe is ON for:\n" + "\n".join(lines)
 
 
 def find_forcesub(context, arg: str):
     rows = db(context).list_forcesub()
     arg_l = arg.strip().lstrip("@").lower()
-    for index, (chat_id, _title, link) in enumerate(rows, 1):
+    for index, (chat_id, _title, link, _mode) in enumerate(rows, 1):
         username = link.rsplit("/", 1)[-1].lower() if "/+" not in link else ""
         if arg == str(chat_id) or (username and arg_l == username):
             return chat_id
@@ -874,12 +891,19 @@ async def forcesub_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target = parse_chat_id(args[1])
         if target is None:
             target = args[1] if args[1].startswith("@") else "@" + args[1]
+        mode = "request" if len(args) > 2 and args[2].lower() == "request" else "normal"
         try:
             chat = await context.bot.get_chat(target)
             me = await context.bot.get_chat_member(chat.id, context.bot.id)
             if me.status not in ("administrator", "creator"):
                 raise ValueError("bot is not admin")
-            if chat.username:
+            if mode == "request":
+                # invite link that asks people to send a join request
+                invite = await context.bot.create_chat_invite_link(
+                    chat.id, name="Force subscribe", creates_join_request=True
+                )
+                link = invite.invite_link
+            elif chat.username:
                 link = f"https://t.me/{chat.username}"
             else:
                 link = await context.bot.export_chat_invite_link(chat.id)
@@ -891,7 +915,7 @@ async def forcesub_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "for private channels)."
             )
             return
-        d.add_forcesub(chat.id, chat.title or str(chat.id), link)
+        d.add_forcesub(chat.id, chat.title or str(chat.id), link, mode)
         await message.reply_text("Added.\n\n" + forcesub_list_text(context))
     else:
         await message.reply_text(FORCESUB_HELP)
@@ -1015,6 +1039,21 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await message.reply_text(GREETING)
 
 
+async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remember join requests for force-sub channels (request mode)."""
+    request = update.chat_join_request
+    chat_id, user_id = request.chat.id, request.from_user.id
+    d = db(context)
+    if chat_id not in {row[0] for row in d.list_forcesub()}:
+        return
+    d.add_join_request(chat_id, user_id)
+    if d.get_setting("autoapprove") == "1":
+        try:
+            await context.bot.approve_chat_join_request(chat_id, user_id)
+        except TelegramError as exc:
+            log.warning("Could not approve join request: %s", exc)
+
+
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.error("Unhandled error", exc_info=context.error)
 
@@ -1114,11 +1153,14 @@ def main():
             on_message,
         )
     )
+    application.add_handler(ChatJoinRequestHandler(on_join_request))
     application.add_error_handler(on_error)
 
     start_health_server()
     log.info("Bot is starting...")
-    application.run_polling(drop_pending_updates=True)
+    application.run_polling(
+        drop_pending_updates=True, allowed_updates=Update.ALL_TYPES
+    )
 
 
 if __name__ == "__main__":
