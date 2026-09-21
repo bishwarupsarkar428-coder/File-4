@@ -293,14 +293,25 @@ async def shorten(url: str):
         return None
 
 
-async def link_text(context, payload: str, intro: str = "Here is your link:") -> str:
+async def send_link(message, context, payload: str,
+                    intro: str = "Here is your link:", extra: str = ""):
+    """Reply with the shareable link and a SHARE URL button."""
     link = make_link(context, payload)
-    text = f"{intro}\n{link}"
+    share = link
+    text = f"<b>{escape(intro)}</b>\n\n{escape(link)}"
     if db(context).get_setting("short") == "1" and shortener_ready():
         short = await shorten(link)
         if short:
-            text += f"\n\nShort link:\n{short}"
-    return text
+            text += f"\n\n<b>Short link:</b>\n{escape(short)}"
+            share = short
+    if extra:
+        text += f"\n\n{escape(extra)}"
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "SHARE URL", url="https://t.me/share/url?url=" + urllib.parse.quote(share, safe="")
+        )
+    ]])
+    await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
 
 # ------------------------------- sending files ------------------------------ #
@@ -381,8 +392,11 @@ async def deliver_payload(update, context, payload):
         return
     if minutes:
         note = await message.reply_text(
-            f"⏳ These files will be deleted in {minutes} minute(s). "
-            "Forward or save them now."
+            "⚠️ <u>Important</u>:\n\n"
+            f"<i>All Messages will be deleted after <b>{minutes} minutes</b>. "
+            "Please save or forward these messages to your "
+            "<b>personal saved messages</b> to avoid losing them!</i>",
+            parse_mode=ParseMode.HTML,
         )
         spawn(delete_later(context.bot, chat_id, sent_ids + [note.message_id], minutes * 60))
 
@@ -580,13 +594,10 @@ async def genlink_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         item = build_item(replied)
         if item:
             code = db(context).create_link([item], created_by=update.effective_user.id)
-            await message.reply_text(await link_text(context, code))
+            await send_link(message, context, code)
             return
     context.user_data["flow"] = {"type": "genlink"}
-    await message.reply_text(
-        "Send me the message or file you want to store.\n"
-        "Tip: you can also reply to any message with /genlink."
-    )
+    await message.reply_text("Send A Message For To Get Your Shareable Link")
 
 
 async def batch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -705,21 +716,17 @@ async def done_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "an admin there and you added at most 1000 messages."
             )
             return
-        await message.reply_text(await link_text(context, payload))
+        await send_link(message, context, payload)
         return
 
     if mode == "special" and flow["edit_code"]:
         d.replace_link(flow["edit_code"], flow["items"])
-        await message.reply_text(
-            "Link updated (same link):\n" + make_link(context, flow["edit_code"])
-        )
+        await send_link(message, context, flow["edit_code"], intro="Link updated (same link):")
         return
 
     code = d.create_link(flow["items"], editable=(mode == "special"), created_by=user_id)
-    text = await link_text(context, code)
-    if mode == "special":
-        text += f"\n\nTo edit it later: /special_link {code}"
-    await message.reply_text(text)
+    extra = f"To edit it later: /special_link {code}" if mode == "special" else ""
+    await send_link(message, context, code, extra=extra)
 
 
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1035,7 +1042,7 @@ async def handle_flow(update, context, flow):
             return
         context.user_data.pop("flow", None)
         code = db(context).create_link([item], created_by=user_id)
-        await message.reply_text(await link_text(context, code))
+        await send_link(message, context, code)
 
     elif kind == "collect":
         item = build_item(message)
@@ -1077,7 +1084,7 @@ async def handle_flow(update, context, flow):
             return
         context.user_data.pop("flow", None)
         payload = encode_range(chat_id, first_id, msg_id)
-        await message.reply_text(await link_text(context, payload))
+        await send_link(message, context, payload)
 
     elif kind == "shortener":
         match = URL_RE.search(message.text or "")
@@ -1104,7 +1111,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if can_create(user_id) and extract_media(message):
         item = build_item(message)
         code = db(context).create_link([item], created_by=user_id)
-        await message.reply_text(await link_text(context, code))
+        await send_link(message, context, code)
         return
 
     await send_home(message, update.effective_user)
