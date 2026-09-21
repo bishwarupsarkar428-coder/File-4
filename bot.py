@@ -448,8 +448,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text(BANNED_TEXT)
         return
 
-    await message.reply_text(GREETING)
     if not context.args:
+        await message.reply_text(GREETING)  # plain /start only
         return
 
     payload = context.args[0]
