@@ -14,6 +14,7 @@ import re
 import threading
 import urllib.parse
 import urllib.request
+from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 try:  # optional: load variables from a local .env file
@@ -28,6 +29,7 @@ from telegram import (
     BotCommandScopeChat,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    LinkPreviewOptions,
     MessageOriginChannel,
     Update,
 )
@@ -45,7 +47,15 @@ from telegram.ext import (
 
 from db import Database
 
-GREETING = "Hello, I am a file share bot of @TG_HINDI_ANIME69"
+MAIN_CHANNEL = "@TG_HINDI_ANIME69"
+UPDATE_CHANNEL = os.getenv("UPDATE_CHANNEL", "https://t.me/TG_FILE_STORE69").strip()
+CLONE_URL = os.getenv("CLONE_URL", "").strip()   # optional "Create my own clone" button
+HOME_TEXT = (
+    "<i>Hello {mention} ✨\n\n"
+    "I am a permanent file store bot and users can access stored messages "
+    "by using a shareable link given by me\n\n"
+    "To know more click help button</i>"
+)
 INVALID_LINK = "This link is invalid or has expired."
 BANNED_TEXT = "You are banned from using this bot."
 ADMIN_ONLY = "Only admins can use this command."
@@ -455,7 +465,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not context.args:
-        await message.reply_text(GREETING)  # plain /start only
+        await send_home(message, user)  # plain /start only
         return
 
     payload = context.args[0]
@@ -470,9 +480,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.info("User %s blocked the bot", user.id)
 
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = GREETING + "\n\nOpen a share link to receive files."
-    user_id = update.effective_user.id
+def help_text(user_id: int) -> str:
+    text = "📖 Help\n\nOpen a share link to receive the files.\n/start – restart the bot"
     if can_create(user_id):
         text += (
             "\n\n/genlink – store a single message or file\n"
@@ -491,7 +500,69 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/broadcast – reply to a message to send it to all users\n"
             "/ban <id>, /unban <id>"
         )
-    await update.effective_message.reply_text(text)
+    return text
+
+
+def about_text(context) -> str:
+    return (
+        "🤖 About this bot\n\n"
+        f"Name: {context.bot.first_name}\n"
+        f"Username: @{context.bot.username}\n"
+        "Type: Permanent file store bot\n"
+        f"Owner channel: {MAIN_CHANNEL}\n"
+        f"Updates: {UPDATE_CHANNEL}\n"
+        "Language: Python 3\n"
+        "Library: python-telegram-bot\n\n"
+        "Send me a shareable link to get the stored files."
+    )
+
+
+def home_text(user) -> str:
+    mention = f'<a href="tg://user?id={user.id}">{escape(user.first_name or "there")}</a>'
+    return HOME_TEXT.format(mention=mention)
+
+
+def home_keyboard() -> InlineKeyboardMarkup:
+    rows = [[
+        InlineKeyboardButton("HELP", callback_data="menu:help"),
+        InlineKeyboardButton("ABOUT", callback_data="menu:about"),
+    ]]
+    if CLONE_URL:
+        rows.append([InlineKeyboardButton("CREATE MY OWN CLONE", url=CLONE_URL)])
+    rows.append([InlineKeyboardButton("📟 UPDATE CHANNEL", url=UPDATE_CHANNEL)])
+    return InlineKeyboardMarkup(rows)
+
+
+async def send_home(message, user):
+    await message.reply_text(
+        home_text(user), parse_mode=ParseMode.HTML, reply_markup=home_keyboard()
+    )
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(help_text(update.effective_user.id))
+
+
+async def menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    action = query.data.split(":", 1)[1]
+    back = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ BACK", callback_data="menu:home")]])
+    try:
+        if action == "help":
+            await query.edit_message_text(help_text(query.from_user.id), reply_markup=back)
+        elif action == "about":
+            await query.edit_message_text(
+                about_text(context), reply_markup=back,
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+            )
+        else:
+            await query.edit_message_text(
+                home_text(query.from_user), parse_mode=ParseMode.HTML,
+                reply_markup=home_keyboard(),
+            )
+    except BadRequest:
+        pass  # "message is not modified" etc.
+    await query.answer()
 
 
 async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1036,7 +1107,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text(await link_text(context, code))
         return
 
-    await message.reply_text(GREETING)
+    await send_home(message, update.effective_user)
 
 
 async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1147,6 +1218,7 @@ def main():
     ):
         application.add_handler(CommandHandler(name, callback))
     application.add_handler(CallbackQueryHandler(settings_cb, pattern=r"^set:"))
+    application.add_handler(CallbackQueryHandler(menu_cb, pattern=r"^menu:"))
     application.add_handler(
         MessageHandler(
             filters.ChatType.PRIVATE & ~filters.COMMAND & (media_filter | filters.TEXT),
